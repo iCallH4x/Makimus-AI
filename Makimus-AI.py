@@ -1822,7 +1822,40 @@ class ImageSearchApp:
             except Exception:
                 pass
 
+            # ── Pre-filter with ffprobe ──────────────────────────────────────────
+            # cv2.VideoCapture() hangs inside FFmpeg C code on malformed files
+            # (e.g. MP3 audio in .mp4 container). ffprobe only reads the header —
+            # it never hangs and tells us if a video stream exists before we risk
+            # the OpenCV call. Fall back to "let OpenCV try" if ffprobe is missing.
+            def _has_video_stream(path):
+                try:
+                    result = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                         '-show_entries', 'stream=codec_type', '-of', 'csv=p=0',
+                         get_safe_path(path)],
+                        capture_output=True, text=True, timeout=10,
+                        creationflags=(0x08000000 if os.name == 'nt' else 0)
+                    )
+                    return result.stdout.strip() == 'video'
+                except Exception:
+                    return True   # ffprobe unavailable — let OpenCV try (may hang)
+
+            _valid = []
+            _skipped = 0
+            for _p in file_list:
+                if self.stop_indexing:
+                    break
+                if _has_video_stream(_p):
+                    _valid.append(_p)
+                else:
+                    self._failed_videos.append((_p, "No video stream"))
+                    _skipped += 1
+            if _skipped:
+                safe_print(f"[VINDEX] Pre-filtered {_skipped} non-video file(s)")
+            file_list = _valid
             total = len(file_list)
+            # ────────────────────────────────────────────────────────────────────
+
             existing_set = set(self.video_paths) if is_update else set()
             self._pending_video_batches = []
             CHUNK_SIZE = max(VIDEO_BATCH_SIZE * 2, 32)
