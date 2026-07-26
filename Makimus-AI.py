@@ -1802,7 +1802,7 @@ class ImageSearchApp:
             torch = None
 
         try:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
             import threading as _threading
 
             # Suppress FFmpeg/h264 codec warnings globally before any VideoCapture opens.
@@ -1822,11 +1822,12 @@ class ImageSearchApp:
             except Exception:
                 pass
 
-            # ── Pre-filter with ffprobe ──────────────────────────────────────────
+            # ── Pre-filter with ffprobe (parallel) ────────────────────────────
             # cv2.VideoCapture() hangs inside FFmpeg C code on malformed files
             # (e.g. MP3 audio in .mp4 container). ffprobe only reads the header —
             # it never hangs and tells us if a video stream exists before we risk
-            # the OpenCV call. Fall back to "let OpenCV try" if ffprobe is missing.
+            # the OpenCV call. 4 workers keep the probe fast (~100 files/s).
+            # Fall back to "let OpenCV try" if ffprobe is missing.
             def _has_video_stream(path):
                 try:
                     result = subprocess.run(
@@ -1836,20 +1837,33 @@ class ImageSearchApp:
                         capture_output=True, text=True, timeout=10,
                         creationflags=(0x08000000 if os.name == 'nt' else 0)
                     )
+                    if result.returncode != 0:
+                        return True   # ffprobe can't parse — let OpenCV try
                     return result.stdout.strip() == 'video'
                 except Exception:
                     return True   # ffprobe unavailable — let OpenCV try (may hang)
 
             _valid = []
             _skipped = 0
-            for _p in file_list:
-                if self.stop_indexing:
-                    break
-                if _has_video_stream(_p):
-                    _valid.append(_p)
-                else:
-                    self._failed_videos.append((_p, "No video stream"))
-                    _skipped += 1
+            _total_pre = len(file_list)
+            with ThreadPoolExecutor(max_workers=4) as _probe_exec:
+                _futures = {_probe_exec.submit(_has_video_stream, p): p for p in file_list}
+                for _i, _fut in enumerate(as_completed(_futures)):
+                    if self.stop_indexing:
+                        break
+                    _path = _futures[_fut]
+                    try:
+                        if _fut.result():
+                            _valid.append(_path)
+                        else:
+                            self._failed_videos.append((_path, "No video stream"))
+                            _skipped += 1
+                    except Exception:
+                        _valid.append(_path)  # probe errored — let OpenCV try
+                    if (_i + 1) % 100 == 0:
+                        safe_print(f"\r[VINDEX] Probing: {_i + 1:,}/{_total_pre:,}", end='')
+            if _total_pre >= 100:
+                safe_print(f"\r[VINDEX] Probing: {_total_pre:,}/{_total_pre:,}")
             if _skipped:
                 safe_print(f"[VINDEX] Pre-filtered {_skipped} non-video file(s)")
             file_list = _valid
