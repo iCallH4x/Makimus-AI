@@ -1802,7 +1802,7 @@ class ImageSearchApp:
             torch = None
 
         try:
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError
             import threading as _threading
 
             # Suppress FFmpeg/h264 codec warnings globally before any VideoCapture opens.
@@ -1870,6 +1870,17 @@ class ImageSearchApp:
                     if not cap.isOpened():
                         safe_print(f"[VINDEX] Cannot open: {abs_video_path}")
                         return (rel_path, frames)
+
+                    # Quick sanity probe — skip files that open but can't decode
+                    # (e.g. MP3 audio in .mp4 container). Most bad files fail here
+                    # instantly; the 60s timeout on future.result() is the safety net.
+                    _probe_ret, _probe_frame = cap.read()
+                    if not _probe_ret or _probe_frame is None:
+                        safe_print(f"[VINDEX] Skipping {os.path.basename(abs_video_path)}: not a valid video (opens but can't decode)")
+                        cap.release()
+                        return (rel_path, frames)
+                    # Rewind so the real extraction starts from the beginning
+                    cap.set(cv2.CAP_PROP_POS_MSEC, 0)
 
                     fps = cap.get(cv2.CAP_PROP_FPS)
                     total_frames_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -1975,7 +1986,15 @@ class ImageSearchApp:
                             break
 
                         try:
-                            rel_video_path, frame_list = future.result()
+                            rel_video_path, frame_list = future.result(timeout=60)
+                        except TimeoutError:
+                            safe_print(f"[VINDEX] ⚠ Timed out after 60s — skipping hung file #{file_idx}")
+                            try:
+                                future.cancel()
+                            except Exception:
+                                pass
+                            file_idx += 1
+                            continue
                         except Exception as fe:
                             safe_print(f"[VINDEX] Future error for file {file_idx}: {fe}")
                             file_idx += 1
